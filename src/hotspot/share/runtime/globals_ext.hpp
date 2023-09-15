@@ -86,6 +86,8 @@
                                                                             \
   product(bool, AppCDSVerifyClassPathOrder, true,                           \
           "Verify classpath order between the dump phase and replay phase") \
+  product(bool, CDSIgnoreFileTimeCheck, false,                              \
+          "do not check timestamp of jar file when using CDS")              \
                                                                             \
   //add new AJDK specific flags here
 

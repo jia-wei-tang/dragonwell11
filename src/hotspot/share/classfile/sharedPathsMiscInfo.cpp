@@ -34,6 +34,7 @@
 #include "runtime/arguments.hpp"
 #include "runtime/os.inline.hpp"
 #include "utilities/ostream.hpp"
+#include "runtime/quickStart.hpp"
 
 SharedPathsMiscInfo::SharedPathsMiscInfo() {
   _app_offset = 0;
@@ -257,8 +258,14 @@ bool SharedPathsMiscInfo::check(jint type, const char* path) {
     break;
   case APP_PATH:
     {
+      int new_path_len = QuickStart::get_max_replaced_path_len(path) + 1;
+      char* new_path = NEW_C_HEAP_ARRAY(char, new_path_len, mtInternal);
+      int origin_len = (int)strlen(path);
+      tty->print_cr("origin path len: %d; new len: %d", origin_len, new_path_len);
+      QuickStart::convert_path_by_env(path, new_path);
+      ClassLoader::trace_class_path("new_path: ", new_path);
       if (AppCDSVerifyClassPathOrder) {
-        size_t len = strlen(path);
+        size_t len = strlen(new_path);
         const char *appcp = Arguments::get_appclasspath();
         assert(appcp != NULL, "NULL app classpath");
         size_t appcp_len = strlen(appcp);
@@ -266,10 +273,12 @@ bool SharedPathsMiscInfo::check(jint type, const char* path) {
           return fail("Run time APP classpath is shorter than the one at dump time: ", appcp);
         }
         // Prefix is OK: E.g., dump with -cp foo.jar, but run with -cp foo.jar:bar.jar.
-        if (os::file_name_strncmp(path, appcp, len) != 0) {
+        if (os::file_name_strncmp(new_path, appcp, len) != 0) {
+          FREE_C_HEAP_ARRAY(char, new_path);
           return fail("[APP classpath mismatch, actual: -Djava.class.path=", appcp);
         }
         if (appcp[len] != '\0' && appcp[len] != os::path_separator()[0]) {
+          FREE_C_HEAP_ARRAY(char, new_path);
           return fail("Dump time APP classpath is not a proper prefix of run time APP classpath: ", appcp);
         }
       } else {
@@ -279,13 +288,15 @@ bool SharedPathsMiscInfo::check(jint type, const char* path) {
         int n_app;
         char **app_elements = os::split_path(appcp, &n_app);
         if (NULL == app_elements) {
+          FREE_C_HEAP_ARRAY(char, new_path);
           return fail("Split app path failed!", appcp);
         }
         int n_path;
-        char **path_elements = os::split_path(path, &n_path);
+        char **path_elements = os::split_path(new_path, &n_path);
         if (NULL == path_elements) {
           free_string_array(app_elements, n_app);
-          return fail("Split path failed!", path);
+          FREE_C_HEAP_ARRAY(char, new_path);
+          return fail("Split path failed!", new_path);
         }
 
         qsort(app_elements, n_app, sizeof(*app_elements), qsort_strcmp);
@@ -310,9 +321,11 @@ bool SharedPathsMiscInfo::check(jint type, const char* path) {
         free_string_array(app_elements, n_app);
         free_string_array(path_elements, n_path);
         if (i != n_path) {
+          FREE_C_HEAP_ARRAY(char, new_path);
           return fail("[APP classpath mismatch, actual: -Djava.class.path=", appcp);
         }
       }
+      FREE_C_HEAP_ARRAY(char, new_path);
     }
     break;
   default:

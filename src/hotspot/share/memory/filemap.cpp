@@ -51,6 +51,7 @@
 #include "runtime/java.hpp"
 #include "runtime/mutexLocker.hpp"
 #include "runtime/os.inline.hpp"
+#include "runtime/quickStart.hpp"
 #include "runtime/vm_version.hpp"
 #include "services/memTracker.hpp"
 #include "utilities/align.hpp"
@@ -276,6 +277,13 @@ bool SharedClassPathEntry::validate(bool is_class_path) {
     name = this->name();
   }
 
+  bool replaced = false;
+  char* new_ent_name = QuickStart::replace_if_contains(name, &replaced);
+  if (replaced) {
+    log_info(class, path)("replace %s with %s", name, new_ent_name);
+    name = new_ent_name;
+  }
+
   bool ok = true;
   log_info(class, path)("checking shared classpath entry: %s", name);
   if (os::stat(name, &st) != 0 && is_class_path) {
@@ -293,7 +301,7 @@ bool SharedClassPathEntry::validate(bool is_class_path) {
       ok = false;
     }
   } else if ((has_timestamp() && _timestamp != st.st_mtime) ||
-             _filesize != st.st_size) {
+             _filesize != st.st_size  && !CDSIgnoreFileTimeCheck) {
     ok = false;
     if (PrintSharedArchiveAndExit) {
       FileMapInfo::fail_continue(_timestamp != st.st_mtime ?
@@ -304,6 +312,7 @@ bool SharedClassPathEntry::validate(bool is_class_path) {
                                  " the shared archive file: %s", name);
     }
   }
+  FREE_C_HEAP_ARRAY(char, new_ent_name);
   return ok;
 }
 
@@ -523,6 +532,8 @@ bool FileMapInfo::validate_shared_path_table() {
   _classpath_entries_for_jvmti = (ClassPathEntry**)os::malloc(sz, mtClass);
   memset(_classpath_entries_for_jvmti, 0, sz);
 #endif
+
+  QuickStart::free_envs_array();
 
   return true;
 }

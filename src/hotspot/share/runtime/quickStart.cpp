@@ -68,6 +68,10 @@ int QuickStart::_jvm_option_count = 0;
 const char** QuickStart::_jvm_options = NULL;
 const char*  QuickStart::_cp_in_metadata_file = NULL;
 
+GrowableArray<const char *>* QuickStart::old_envs = NULL;
+GrowableArray<const char *>* QuickStart::new_envs = NULL;
+int QuickStart::_max_env_diff_len = 0;
+
 enum identifier {
   Features,
   VMVersion,
@@ -110,6 +114,8 @@ int QuickStart::_lock_file_fd = 0;
 #define LOCK_FILE                     "LOCK"
 #define JVM_CONF_FILE                 "jvm_conf"
 #define CDS_DIFF_CLASSES              "cds_diff_classes.lst"
+
+#define ENV_MARK                      "ENV."
 
 QuickStart::~QuickStart() {
   if (_cache_path) {
@@ -557,6 +563,43 @@ bool QuickStart::load_and_validate(JavaVMInitArgs* options_args) {
       trim_tail_newline(cp_buff);
       _cp_in_metadata_file = os::strdup_check_oom(cp_buff);
       FREE_C_HEAP_ARRAY(char, cp_buff);
+    } else if (match_option(line, ENV_MARK, &tail)) {
+      if (old_envs == NULL) {
+        old_envs = new (ResourceObj::C_HEAP, mtInternal) GrowableArray<const char *>(5, true);
+        new_envs = new (ResourceObj::C_HEAP, mtInternal) GrowableArray<const char *>(5, true);
+      }
+      // remove line_separator in line
+      char* pos = strstr(line, os::line_separator());
+      if (pos != NULL) {
+        *pos = '\0';
+      }
+      if (tail[0] != '\0') {
+        int p1 = strlen(ENV_MARK);
+        int p2 = strchr(line, '=') - line;
+        // e.g. from ENV.PWD=Path get Path
+        int old_env_len = strlen(line) - p2 -1;
+        char* old_env = NEW_C_HEAP_ARRAY(char, old_env_len + 1, mtInternal); // char + \0
+        strncpy(old_env, &line[p2+1], old_env_len);
+        old_env[old_env_len] = '\0';
+        old_envs->append(old_env);
+        // e.g. from ENV.PWD=PATH get PWD
+        char* env_name = NEW_C_HEAP_ARRAY(char, p2 - p1 + 1, mtInternal);
+        strncpy(env_name, &line[p1], p2-p1);
+        env_name[p2-p1] = '\0';
+        char* new_env_val = ::getenv(env_name);
+        FREE_C_HEAP_ARRAY(char, env_name);
+        // copy new_env
+        int new_env_len = strlen(new_env_val);
+        char* new_env = NEW_C_HEAP_ARRAY(char, new_env_len + 1, mtInternal);
+        strncpy(new_env, new_env_val, new_env_len);
+        new_env[new_env_len] = '\0';
+        new_envs->append(new_env);
+        tty->print_cr("old_env: %s", old_env);
+        tty->print_cr("new_env: %s", new_env);
+        if (new_env_len - old_env_len > _max_env_diff_len) {
+          _max_env_diff_len = new_env_len - old_env_len;
+        }
+      }
     }
   }
   return true;
@@ -1005,8 +1048,128 @@ bool QuickStart::dump_cached_info(JavaVMInitArgs* options_args) {
     _temp_metadata_file->print_cr("%s", option->optionString);
   }
 
+  const char* envs = Arguments::get_property("com.alibaba.cds.cp.reloc.envs");
+  if (envs != NULL) {
+    char env_i[JVM_MAXPATHLEN];
+    int p1 = 0, p2 = 0;
+    bool envs_process_end = false;
+    while(!envs_process_end) {
+      if (envs[p2] == '\0') {
+        envs_process_end = true;
+      }
+      if((envs[p2] == ',' || envs[p2] == '\0')) {
+        strncpy(env_i, &envs[p1], p2-p1);
+        env_i[p2-p1] = '\0';
+        p1 = p2 + 1;
+        const char* env_i_value = ::getenv(env_i);
+        if(env_i_value != NULL) {
+          _temp_metadata_file->print_cr("%s%s=%s", ENV_MARK, env_i, env_i_value);
+        }
+      }
+      p2++;
+    }
+  }
+
   _temp_metadata_file->flush();
   return true;
+}
+
+void QuickStart::convert_path_by_env(const char* origin_path, char* new_path) {
+  if (old_envs == NULL) {
+    strcpy(new_path, origin_path);
+    tty->print_cr("Don't need to convert path according to environment variables.");
+    return;
+  }
+
+  int p1 = 0, p2 = p1;
+  bool process_end = false;
+  while (!process_end) {
+    if (origin_path[p2] == '\0') {
+      process_end = true;
+    }
+    if((origin_path[p2] == *os::path_separator() || origin_path[p2] == '\0')) {
+      char split[JVM_MAXPATHLEN];
+      strncpy(split, &origin_path[p1], p2-p1);
+      split[p2-p1] = '\0';
+      bool replaced = false;
+      char* path = replace_if_contains(split, &replaced);
+      // if (replaced) {
+      //   tty->print_cr("origin path: %s", split);
+      //   tty->print_cr("new path: %s", path);
+      // } else {
+      //   tty->print_cr("origin-new path: %s", path);
+      // }
+      strcat(new_path, path);
+      FREE_C_HEAP_ARRAY(char, path);
+      if (origin_path[p2] == *os::path_separator()) {
+        strcat(new_path, os::path_separator());
+      } else {
+        strcat(new_path, "\0");
+      }
+      p1 = p2 + 1;
+    }
+    p2++;
+  }
+
+  tty->print_cr("replace %s", origin_path);
+  tty->print_cr("with new_path: %s", new_path);
+}
+
+void QuickStart::free_envs_array() {
+  if(old_envs != NULL) {
+    int len = old_envs->length();
+    for (int i = 0; i < len; i++){
+      FREE_C_HEAP_ARRAY(char, old_envs->at(i));
+      FREE_C_HEAP_ARRAY(char, new_envs->at(i));
+    }
+    old_envs->clear();
+    new_envs->clear();
+    delete old_envs;
+    old_envs = NULL;
+    delete new_envs;
+    new_envs = NULL;
+  }
+}
+
+char* QuickStart::replace_if_contains(const char* path, bool* replaced) {
+  if(old_envs != NULL) {
+    int array_cnt = old_envs->length();
+    for(int i = 0; i < array_cnt; i++) {
+      const char* target = old_envs->at(i);
+      if(strstr(path, target) != NULL) {
+        int target_len = strlen(target);
+        const char* new_target = new_envs->at(i);
+        int new_target_len = strlen(new_target);
+        char* new_path = NEW_C_HEAP_ARRAY(char, new_target_len + strlen(path) - target_len + 1, mtInternal);
+        new_path[0] = '\0'; // clear the buffer
+        strcat(new_path, new_target);
+        strcat(new_path, &path[target_len]);
+        strcat(new_path, "\0");
+        *replaced = true;
+        return new_path;
+      }
+    }
+  }
+
+  char* new_path = NEW_C_HEAP_ARRAY(char, strlen(path) + 1, mtInternal);
+  strcpy(new_path, path);
+  *replaced = false;
+  return new_path;
+}
+
+int QuickStart::get_max_replaced_path_len(const char* origin_path) {
+  int origin_path_len = (int)strlen(origin_path);
+  if (_max_env_diff_len <= 0) return origin_path_len;
+  int count = 1;
+  int p = 0;
+  while(origin_path[p] != '\0') {
+    if (origin_path[p] == *os::path_separator()) {
+      count++;
+    }
+    p++;
+  }
+  tty->print_cr("additional: %d", count * _max_env_diff_len);
+  return origin_path_len + (count * _max_env_diff_len);
 }
 
 bool QuickStart::enable_by_env(const JavaVMInitArgs *options_args) {
